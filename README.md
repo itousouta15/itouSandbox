@@ -6,7 +6,7 @@ C / C++ / Python / JavaScript 判題現在都走這裡。Java 還沒做，暫時
 
 ## 為什麼要自己刻
 
-Piston 的沙箱只管 CPU / 記憶體 / 時間跟檔案系統範圍，**不管使用者程式碼能不能呼叫子程序**——`import subprocess` 或 `os.system` 在容器裡就能跑任意指令。itouOJ 原本只靠一份 [`sitecustomize.py`](../deploy/piston-python-sitecustomize.py) 在 Python 直譯器層級擋這件事，C/C++/Java/JavaScript 完全沒有保護。
+Piston 的沙箱只管 CPU / 記憶體 / 時間跟檔案系統範圍，**不管使用者程式碼能不能呼叫子程序**——`import subprocess` 或 `os.system` 在容器裡就能跑任意指令。itouOJ 原本只靠一份 [`sitecustomize.py`](https://github.com/itousouta15/itouOJ/blob/master/deploy/piston-python-sitecustomize.py) 在 Python 直譯器層級擋這件事，C/C++/Java/JavaScript 完全沒有保護。
 
 這個專案要的是語言無關、核心層級的防護，而不是每種語言在應用層各自擋一次。`sitecustomize.py` 這類稽核鉤子仍然有價值（比字串黑名單擋 `import` 紮實），但它是應用層的第二道防線；真正的邊界是下面這三層——就算鉤子有漏洞或整個拿掉，`fork`/`execve /bin/sh` 這類逃逸手法一樣會在 seccomp/namespace 被攔下（見〈驗證方式〉）。
 
@@ -111,7 +111,7 @@ jail <rootfs-dir> <mem-limit-mb> <pids-max> <timeout-ms> <seccomp-profile> <prog
 | JavaScript (Node 20) | ✅ 正式站使用中 | fork-bomb 防線靠 `pids.max` |
 | Java | ❌ 未實作 | JVM 的 syscall 面最廣，留到最後 |
 
-`judge.ts` 用 [`src/lib/execute.ts`](../src/lib/execute.ts) 按語言分流，兩條路徑互相獨立（已用「關掉 sandbox-server，確認 Java 提交照樣正常」實測驗證）。
+`judge.ts` 用 [`src/lib/execute.ts`](https://github.com/itousouta15/itouOJ/blob/master/src/lib/execute.ts) 按語言分流，兩條路徑互相獨立（已用「關掉 sandbox-server，確認 Java 提交照樣正常」實測驗證）。
 
 ## 驗證方式
 
@@ -148,4 +148,4 @@ cd sandbox-runner && make        # 產出 jail、sandbox-server
 - 編譯階段（`gcc`/`g++`）本身還沒沙箱化
 - rootfs 直接 bind mount 整個 host `/usr`，還沒收斂成只含實際用到的 `.so`
 - 逾時偵測是 5ms 輪詢，不是 `timerfd`，精度夠用但不是最優
-- Piston（Java 用）的三個補丁是 `docker exec ... sed -i` 直接改 container 內部檔案（見主 [README.md](../README.md#部署)）——Piston image 更新後 `sed` 可能悄悄不匹配、補丁靜默失效。比較耐用的做法是維護自己的 patch 檔 + 自建 image，目前 Java 量還小，先沒做這個重構
+- Piston（Java 用）的三個補丁是 `docker exec ... sed -i` 直接改 container 內部檔案（見主站 [itouOJ README](https://github.com/itousouta15/itouOJ#部署)）——Piston image 更新後 `sed` 可能悄悄不匹配、補丁靜默失效。比較耐用的做法是維護自己的 patch 檔 + 自建 image，目前 Java 量還小，先沒做這個重構
