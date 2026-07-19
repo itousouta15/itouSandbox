@@ -1,4 +1,4 @@
-# sandbox-runner
+# itouSandbox
 
 > 從零實作的 Linux 判題沙箱：namespace 隔離 + cgroup v2 資源限制 + seccomp-bpf syscall 白名單。跑在正式站 [oj.itousouta.me](https://oj.itousouta.me) 上，取代原本的 [Piston](https://github.com/engineer-man/piston)。
 
