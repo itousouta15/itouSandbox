@@ -23,6 +23,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <signal.h>
 
 #include "caps.h"
 #include "cgroup.h"
@@ -41,12 +42,50 @@
 #define HOST_ID_BASE 200000
 #define HOST_ID_RANGE 65536
 
+// The interactive service stops the supervisor, which must kill the whole
+// cgroup and reap the namespace child before exiting (not orphan a live run).
+static volatile sig_atomic_t stop_requested = 0;
+static void request_stop(int sig) {
+  (void)sig;
+  stop_requested = 1;
+}
+
+static long cpu_time_ms(const char *cgroup_path) {
+  char path[CGROUP_PATH_MAX + 32];
+  snprintf(path, sizeof(path), "%s/cpu.stat", cgroup_path);
+  FILE *file = fopen(path, "r");
+  if (!file) return -1;
+  char key[64];
+  long value, result = -1;
+  while (fscanf(file, "%63s %ld", key, &value) == 2) {
+    if (strcmp(key, "usage_usec") == 0) { result = value / 1000; break; }
+  }
+  fclose(file);
+  return result;
+}
+
 struct child_args {
   const char *rootfs;
   const char *cgroup_path;
   const char *seccomp_profile;
   int sync_read_fd;
   char *const *argv;
+  // Host path of an interpreter runtime package (Piston's python/node
+  // tree) to bind-mount read-only at /opt/runtime inside the rootfs.
+  // NULL for compiled languages and for the compile phase. Bind + RO
+  // remount happen inside the child's own user namespace -- mounts created
+  // by the parent (host user namespace) can't be remounted by the child
+  // (ns_capable check on the mount's owning userns), which is what the
+  // final recursive read-only lockdown depends on.
+  const char *runtime_home;
+  // See pivot_into_rootfs(): the compile phase needs to write its output
+  // binary (and scratch files) inside this rootfs, so it can't get the
+  // same "whole tree read-only" lockdown the run phase gets. Derived from
+  // seccomp_profile == "compile" in main() -- see the security report
+  // this responds to (host-side unsandboxed compilation letting a
+  // submission's #include read arbitrary host files via compiler
+  // diagnostics).
+  int compile_mode;
 };
 
 static int write_file(const char *path, const char *content) {
@@ -65,7 +104,7 @@ static int write_file(const char *path, const char *content) {
   return 0;
 }
 
-static int pivot_into_rootfs(const char *rootfs) {
+static int pivot_into_rootfs(const char *rootfs, int compile_mode) {
   // Detach from the host's mount propagation tree before touching anything,
   // otherwise later mounts/unmounts here would propagate back to the host.
   if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) == -1) {
@@ -124,6 +163,26 @@ static int pivot_into_rootfs(const char *rootfs) {
     return -1;
   }
 
+  if (compile_mode) {
+    // Compile writes its output binary and scratch files inside this
+    // rootfs (at /work, /bin, /tmp -- all plain directories the caller
+    // freshly created for this one request, never shared with anything
+    // else), so it can't take the same "whole tree read-only" lockdown
+    // below. Only /usr -- the compiler toolchain, bind-mounted by the
+    // caller before this ran -- gets locked read-only here; a
+    // non-recursive-beyond-itself remount of one mountpoint can't affect
+    // unrelated siblings elsewhere in the tree. Everything else in this
+    // view is either that read-only toolchain or this request's own
+    // empty scratch dirs -- there is no host path reachable from here
+    // beyond what the caller explicitly bind-mounted.
+    if (mount(NULL, "/usr", NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_REC,
+              NULL) == -1) {
+      perror("remount /usr read-only");
+      return -1;
+    }
+    return 0;
+  }
+
   // Everything above needed the rootfs writable (staging/removing
   // .old_root). Lock it down now, right before the untrusted program runs.
   // A plain MS_BIND mount ignores MS_RDONLY, so making it stick needs a
@@ -134,6 +193,65 @@ static int pivot_into_rootfs(const char *rootfs) {
     return -1;
   }
 
+  return 0;
+}
+
+static int bind_ro(const char *src, const char *dst) {
+  if (mount(src, dst, NULL, MS_BIND, NULL) == -1) {
+    perror("bind mount");
+    return -1;
+  }
+  // A plain MS_BIND mount ignores MS_RDONLY; make it stick with a second
+  // MS_REMOUNT pass. Both calls run inside the child's own user namespace
+  // so the resulting mount is owned by it and can be covered by the final
+  // recursive read-only lockdown.
+  if (mount(NULL, dst, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) == -1) {
+    perror("remount bind read-only");
+    return -1;
+  }
+  return 0;
+}
+
+// Bind host /usr (shared libs / dynamic linker / toolchain) and, for
+// interpreted languages, the runtime package at /opt/runtime -- both
+// read-only, created inside this user namespace (see the runtime_home
+// comment in child_args for why ownership matters).
+static int setup_rootfs_mounts(const char *rootfs, const char *runtime_home) {
+  char dst[400];
+  snprintf(dst, sizeof(dst), "%s/usr", rootfs);
+  if (mkdir(dst, 0755) == -1 && errno != EEXIST) {
+    perror("mkdir rootfs/usr");
+    return -1;
+  }
+  if (bind_ro("/usr", dst) == -1) return -1;
+
+  if (runtime_home) {
+    snprintf(dst, sizeof(dst), "%s/opt", rootfs);
+    if (mkdir(dst, 0755) == -1 && errno != EEXIST) {
+      perror("mkdir rootfs/opt");
+      return -1;
+    }
+    snprintf(dst, sizeof(dst), "%s/opt/runtime", rootfs);
+    if (mkdir(dst, 0755) == -1 && errno != EEXIST) {
+      perror("mkdir rootfs/opt/runtime");
+      return -1;
+    }
+    if (bind_ro(runtime_home, dst) == -1) return -1;
+  }
+
+  // Replicate the merged-/usr symlinks so the dynamic linker resolves
+  // /lib64/ld-linux-x86-64.so.2 normally inside the pivot_root'd rootfs.
+  char link[400];
+  snprintf(link, sizeof(link), "%s/lib", rootfs);
+  if (symlink("usr/lib", link) == -1 && errno != EEXIST) {
+    fprintf(stderr, "[jail] symlink %s: %s\n", link, strerror(errno));
+    return -1;
+  }
+  snprintf(link, sizeof(link), "%s/lib64", rootfs);
+  if (symlink("usr/lib64", link) == -1 && errno != EEXIST) {
+    fprintf(stderr, "[jail] symlink %s: %s\n", link, strerror(errno));
+    return -1;
+  }
   return 0;
 }
 
@@ -164,7 +282,10 @@ static int child_main(void *arg) {
   // ns-root at this point -- must happen BEFORE dropping to an unprivileged
   // uid below, since setuid() away from 0 clears the effective capability
   // set immediately.
-  if (pivot_into_rootfs(a->rootfs) == -1) {
+  if (setup_rootfs_mounts(a->rootfs, a->runtime_home) == -1) {
+    _exit(127);
+  }
+  if (pivot_into_rootfs(a->rootfs, a->compile_mode) == -1) {
     _exit(127);
   }
 
@@ -195,7 +316,9 @@ static int child_main(void *arg) {
     _exit(125);
   }
 
-  char *envp[] = {"PATH=/bin:/usr/bin", "HOME=/", NULL};
+  // libuv must use the existing epoll sandbox policy, not io_uring (which can
+  // perform operations outside seccomp's syscall-by-syscall filtering).
+  char *envp[] = {"PATH=/bin:/usr/bin", "HOME=/", "UV_USE_IO_URING=0", NULL};
   execve(a->argv[0], a->argv, envp);
   perror("execve");
   _exit(127);
@@ -222,6 +345,10 @@ static int wait_with_timeout(pid_t pid, const char *cgroup_path,
   struct timespec start;
   clock_gettime(CLOCK_MONOTONIC, &start);
   *out_timed_out = 0;
+  // Optional trusted supervisor configuration. Waiting for stdin consumes wall
+  // time but almost no CPU; interactive runs get separate budgets.
+  const char *cpu_env = getenv("JAIL_CPU_LIMIT_MS");
+  long cpu_limit = cpu_env ? atol(cpu_env) : 0;
 
   for (;;) {
     pid_t wp = waitpid(pid, out_status, WNOHANG);
@@ -230,14 +357,22 @@ static int wait_with_timeout(pid_t pid, const char *cgroup_path,
       return 0;
     }
     if (wp == -1) {
+      if (errno == EINTR) continue;
       perror("waitpid");
       return -1;
     }
 
-    if (elapsed_ms(&start) >= timeout_ms) {
-      *out_timed_out = 1;
+    long cpu_ms = cpu_limit > 0 ? cpu_time_ms(cgroup_path) : 0;
+    if (stop_requested || elapsed_ms(&start) >= timeout_ms ||
+        (cpu_limit > 0 && (cpu_ms < 0 || cpu_ms >= cpu_limit))) {
+      *out_timed_out = !stop_requested;
       cg_kill(cgroup_path);
-      if (waitpid(pid, out_status, 0) == -1) {
+      // Stop can arrive while the namespace child is still bootstrapping and
+      // has not joined its cgroup yet. Kill PID 1 as well so waitpid cannot hang.
+      kill(pid, SIGKILL);
+      pid_t reaped;
+      do { reaped = waitpid(pid, out_status, 0); } while (reaped < 0 && errno == EINTR);
+      if (reaped == -1) {
         perror("waitpid after cgroup.kill");
         return -1;
       }
@@ -258,10 +393,16 @@ static int write_id_map(pid_t pid, const char *map_name) {
 }
 
 int main(int argc, char *argv[]) {
-  if (argc < 7) {
+  struct sigaction stop_action = {0};
+  stop_action.sa_handler = request_stop;
+  sigemptyset(&stop_action.sa_mask);
+  sigaction(SIGTERM, &stop_action, NULL);
+  sigaction(SIGINT, &stop_action, NULL);
+  if (argc < 8) {
     fprintf(stderr,
             "usage: %s <rootfs-dir> <mem-limit-mb> <pids-max> <timeout-ms> "
-            "<seccomp-profile> <program-path-in-rootfs> [args...]\n",
+            "<seccomp-profile> <runtime-home|-> <program-path-in-rootfs> "
+            "[args...]\n",
             argv[0]);
     return 2;
   }
@@ -271,6 +412,7 @@ int main(int argc, char *argv[]) {
   long pids_max = atol(argv[3]);
   long timeout_ms = atol(argv[4]);
   const char *seccomp_profile = argv[5];
+  const char *runtime_home = strcmp(argv[6], "-") == 0 ? NULL : argv[6];
 
   if (cg_ensure_parent() == -1) {
     return 1;
@@ -294,7 +436,9 @@ int main(int argc, char *argv[]) {
       .cgroup_path = cgroup_path,
       .seccomp_profile = seccomp_profile,
       .sync_read_fd = sync_pipe[0],
-      .argv = &argv[6],
+      .argv = &argv[7],
+      .runtime_home = runtime_home,
+      .compile_mode = strcmp(seccomp_profile, "compile") == 0,
   };
 
   char *stack = malloc(STACK_SIZE);
@@ -352,6 +496,7 @@ int main(int argc, char *argv[]) {
   }
 
   long mem_peak = cg_read_memory_peak(cgroup_path);
+  cg_kill(cgroup_path);
   cg_destroy(cgroup_path);
 
   // When jail is spawned by sandbox-server (M5), fd 3 is an inherited pipe
@@ -362,16 +507,17 @@ int main(int argc, char *argv[]) {
   // human-readable stderr summary for plain CLI/manual use, where fd 3 was
   // never opened by the caller.
   int have_meta_fd = (fcntl(3, F_GETFD) != -1);
+  int quiet = getenv("JAIL_QUIET") != NULL;
   if (have_meta_fd) {
     dprintf(3, "wall_time_ms=%ld\nmemory_peak_bytes=%ld\ntimed_out=%d\n",
             wall_ms, mem_peak, timed_out);
-  } else {
+  } else if (!quiet) {
     fprintf(stderr, "[jail] wall_time_ms=%ld memory_peak_bytes=%ld\n",
             wall_ms, mem_peak);
   }
 
   if (timed_out) {
-    if (!have_meta_fd) {
+    if (!have_meta_fd && !quiet) {
       fprintf(stderr, "[jail] TIMEOUT: killed via cgroup.kill after %ldms\n",
               timeout_ms);
     }
@@ -379,14 +525,14 @@ int main(int argc, char *argv[]) {
   }
   if (WIFEXITED(status)) {
     int code = WEXITSTATUS(status);
-    if (!have_meta_fd) {
+    if (!have_meta_fd && !quiet) {
       fprintf(stderr, "[jail] child exited with code %d\n", code);
     }
     return code;
   }
   if (WIFSIGNALED(status)) {
     int sig = WTERMSIG(status);
-    if (!have_meta_fd) {
+    if (!have_meta_fd && !quiet) {
       // A SIGKILL that wasn't our own timeout kill, before the timeout
       // elapsed, is the cgroup memory controller's OOM kill.
       if (sig == SIGKILL) {
@@ -398,7 +544,7 @@ int main(int argc, char *argv[]) {
     }
     return 128 + sig;
   }
-  if (!have_meta_fd) {
+  if (!have_meta_fd && !quiet) {
     fprintf(stderr, "[jail] child ended in unknown state\n");
   }
   return 1;

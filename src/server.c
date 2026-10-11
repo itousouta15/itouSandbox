@@ -6,21 +6,34 @@
 // Scope for M5: C and C++ only (mirrors what's already hardened through
 // M4). Python/Java/JavaScript are M7's job.
 //
-// Known simplification, called out explicitly: compilation (gcc/g++) runs
-// directly on the host, NOT through the namespace/cgroup/seccomp sandbox --
-// only the compiled binary's RUN phase goes through `jail`. This mirrors
-// the plan's "asymmetric strictness" reasoning (the compiler operates on
-// attacker-controlled *source*, not attacker-controlled *machine code*),
-// but sandboxing the compiler too is legitimate future hardening, not done
-// here.
+// SECURITY FIX (itouoj-critical-compiler-file-read): compilation (gcc/g++)
+// used to run directly on the host, NOT through the namespace/cgroup/
+// seccomp sandbox -- only the compiled binary's RUN phase went through
+// `jail`. The reasoning at the time was "asymmetric strictness" (the
+// compiler operates on attacker-controlled *source*, not attacker-
+// controlled *machine code*), but that missed that the C preprocessor's
+// #include is itself attacker-steerable: a submission could #include an
+// arbitrary host path and have gcc's compile-error diagnostics echo that
+// file's content back through /api/run's compileError, up to and
+// including this app's own .env. Compilation now goes through `jail` too
+// -- see setup_compiler_rootfs() and the "compile" seccomp profile in
+// seccomp.c -- with its own, more permissive-but-still-jailed rootfs
+// (jail.c's pivot_into_rootfs compile_mode path) since it needs to write
+// its output binary, unlike the run phase.
 //
 // Single-threaded by construction (MHD_USE_INTERNAL_POLLING_THREAD without
 // thread-per-connection): one request judged at a time. This is a
 // deliberate, simple concurrency guard -- see the plan's risk note about
 // /api/run having none today.
+//
+// Compile-once caching: the old precompiled_binary/compiled_binary base64
+// protocol is kept for rolling deploys. New callers request a compiled_handle
+// instead; the binary stays in a bounded, private disk cache and each test
+// still runs in a fresh jail. A missing handle re-compiles from source.
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <microhttpd.h>
@@ -31,17 +44,40 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#ifndef PORT
 #define PORT 8090
+#endif
 #define JAIL_BIN "./jail"
 #define WORK_ROOT "./work"
+#define CACHE_ROOT WORK_ROOT "/compiled-cache"
 #define DEFAULT_PIDS_MAX "32"
+// Compile-phase jail limits -- independent of the per-problem run_mem_mb
+// (which bounds the *submission's own* program, not the compiler). gcc/g++
+// with -O2 can need a few hundred MB on complex templates; generous
+// headroom here isn't a correctness concern the way the run phase's limit
+// is, it's just a backstop against a compile that's gone pathological.
+#define COMPILE_MEM_MB 1024
+#define COMPILE_PIDS_MAX "64" // cc1/cc1plus, as, collect2, ld -- a handful
 #define PYTHON_HOME "/opt/piston-data/packages/python/3.12.0"
 #define NODE_HOME "/opt/piston-data/packages/node/20.11.1"
+#define MAX_CAPTURE_BYTES (1024 * 1024)
+// Legacy callers still send static C++ binaries as base64 on every test case.
+#define MAX_REQUEST_BYTES (8 * 1024 * 1024)
+// Leave room for source, stdin and JSON escaping in a cached-binary request.
+// Larger executables simply get recompiled on the next test case.
+#define MAX_LEGACY_BINARY_BYTES (4 * 1024 * 1024)
+// The new handle protocol keeps the binary on disk rather than shipping it
+// through Node on every test case. Disk use is bounded even if callers vanish.
+#define CACHE_ENTRIES 16
+#define CACHE_BYTES (64 * 1024 * 1024)
+#define CACHE_ENTRY_BYTES (16 * 1024 * 1024)
+#define CACHE_IDLE_SECONDS (15 * 60)
 
 struct lang_info {
   const char *key; // matches src/lib/languages.ts's `lang.piston` value
@@ -55,8 +91,15 @@ struct lang_info {
 };
 
 static const struct lang_info LANGS[] = {
-    {"c", "gcc", "main.c", "native", NULL, NULL},
-    {"c++", "g++", "main.cpp", "native", NULL, NULL},
+    // Absolute paths, not bare "gcc"/"g++": the compile phase now runs
+    // inside `jail` (see the compile_mode path below), whose child_main
+    // execve()s directly -- no $PATH lookup like the old host-side
+    // run_child()'s execvp() got away with. Same absolute paths as the
+    // host's `which gcc`/`which g++`, which resolve identically inside
+    // the jail since /usr is bind-mounted at that same absolute path
+    // (see setup_compiler_rootfs).
+    {"c", "/usr/bin/gcc", "main.c", "native", NULL, NULL},
+    {"c++", "/usr/bin/g++", "main.cpp", "native", NULL, NULL},
     {"python", NULL, "main.py", "python", PYTHON_HOME,
      "/opt/runtime/bin/python3.12"},
     {"javascript", NULL, "main.js", "node", NODE_HOME,
@@ -68,6 +111,109 @@ static const struct lang_info *find_lang(const char *key) {
     if (strcmp(LANGS[i].key, key) == 0) return &LANGS[i];
   }
   return NULL;
+}
+
+struct cache_entry {
+  char token[33]; // 128 bits from getrandom, never used as a path from a request
+  char *source;
+  const struct lang_info *lang;
+  size_t bytes;
+  time_t last_used;
+};
+
+static struct cache_entry cache[CACHE_ENTRIES];
+static size_t cache_bytes;
+static int cache_ready;
+
+static void cache_path(char *path, size_t len, const char *token) {
+  snprintf(path, len, "%s/%s", CACHE_ROOT, token);
+}
+
+static void cache_remove(struct cache_entry *entry) {
+  if (!entry->source) return;
+  char path[256];
+  cache_path(path, sizeof(path), entry->token);
+  unlink(path);
+  cache_bytes -= entry->bytes;
+  free(entry->source);
+  memset(entry, 0, sizeof(*entry));
+}
+
+static void cache_expire(time_t now) {
+  for (size_t i = 0; i < CACHE_ENTRIES; i++) {
+    if (cache[i].source && now - cache[i].last_used >= CACHE_IDLE_SECONDS)
+      cache_remove(&cache[i]);
+  }
+}
+
+static struct cache_entry *cache_find(const char *token,
+                                      const struct lang_info *lang,
+                                      const char *source) {
+  if (!cache_ready || strlen(token) != 32) return NULL;
+  cache_expire(time(NULL));
+  for (size_t i = 0; i < CACHE_ENTRIES; i++) {
+    struct cache_entry *entry = &cache[i];
+    if (entry->source && entry->lang == lang &&
+        strcmp(entry->token, token) == 0 &&
+        strcmp(entry->source, source) == 0) return entry;
+  }
+  return NULL;
+}
+
+static const char *cache_store(const char *binary,
+                               const struct lang_info *lang,
+                               const char *source) {
+  if (!cache_ready) return NULL;
+  struct stat st;
+  if (stat(binary, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+      st.st_size > CACHE_ENTRY_BYTES) return NULL;
+  size_t size = (size_t)st.st_size;
+  time_t now = time(NULL);
+  cache_expire(now);
+
+  while (cache_bytes + size > CACHE_BYTES) {
+    struct cache_entry *oldest = NULL;
+    for (size_t i = 0; i < CACHE_ENTRIES; i++) {
+      if (cache[i].source &&
+          (!oldest || cache[i].last_used < oldest->last_used)) oldest = &cache[i];
+    }
+    if (!oldest) return NULL;
+    cache_remove(oldest);
+  }
+
+  struct cache_entry *entry = NULL;
+  for (size_t i = 0; i < CACHE_ENTRIES; i++) {
+    if (!cache[i].source) { entry = &cache[i]; break; }
+  }
+  if (!entry) {
+    entry = &cache[0];
+    for (size_t i = 1; i < CACHE_ENTRIES; i++) {
+      if (cache[i].last_used < entry->last_used) entry = &cache[i];
+    }
+    cache_remove(entry);
+  }
+
+  char *source_copy = strdup(source);
+  if (!source_copy) return NULL;
+  unsigned char random_bytes[16];
+  if (getrandom(random_bytes, sizeof(random_bytes), 0) != sizeof(random_bytes)) {
+    free(source_copy);
+    return NULL;
+  }
+  for (size_t i = 0; i < sizeof(random_bytes); i++)
+    snprintf(entry->token + i * 2, 3, "%02x", random_bytes[i]);
+  char path[256];
+  cache_path(path, sizeof(path), entry->token);
+  if (link(binary, path) != 0) {
+    free(source_copy);
+    return NULL;
+  }
+  entry->source = source_copy;
+  entry->lang = lang;
+  entry->bytes = size;
+  entry->last_used = now;
+  cache_bytes += size;
+  return entry->token;
 }
 
 static const char *signal_name(int sig) {
@@ -92,13 +238,19 @@ static const char *signal_name(int sig) {
 
 // ---- growable buffer ----
 
-static void buf_append(char **buf, size_t *len, const char *data, size_t n) {
+// Return false once a stream reaches its limit. Capturing is performed by the
+// privileged server process, so child cgroup limits do not protect this heap.
+static int buf_append(char **buf, size_t *len, const char *data, size_t n) {
+  if (*len >= MAX_CAPTURE_BYTES) return 0;
+  size_t original_n = n;
+  if (n > MAX_CAPTURE_BYTES - *len) n = MAX_CAPTURE_BYTES - *len;
   char *grown = realloc(*buf, *len + n + 1);
-  if (!grown) return; // best-effort; drop the append rather than crash
+  if (!grown) return 0;
   *buf = grown;
   memcpy(*buf + *len, data, n);
   *len += n;
   (*buf)[*len] = '\0';
+  return n == original_n;
 }
 
 // ---- subprocess execution with non-blocking multiplexed I/O ----
@@ -142,6 +294,7 @@ static int run_child(char *const argv[], const char *stdin_data,
     return -1;
   }
   if (pid == 0) {
+    setpgid(0, 0);
     dup2(in_pipe[0], 0);
     dup2(out_pipe[1], 1);
     dup2(err_pipe[1], 2);
@@ -159,6 +312,10 @@ static int run_child(char *const argv[], const char *stdin_data,
     execvp(argv[0], argv);
     _exit(127);
   }
+
+  // Make group signalling reliable even if the child has not reached its own
+  // setpgid call by the time an output cap is hit.
+  setpgid(pid, pid);
 
   close(in_pipe[0]);
   close(out_pipe[1]);
@@ -178,6 +335,7 @@ static int run_child(char *const argv[], const char *stdin_data,
   struct timespec start;
   clock_gettime(CLOCK_MONOTONIC, &start);
   int killed_for_timeout = 0;
+  int killed_for_output = 0;
 
   while (out_open || err_open || meta_open) {
     struct pollfd fds[4];
@@ -234,7 +392,11 @@ static int run_child(char *const argv[], const char *stdin_data,
       char tmp[4096];
       ssize_t n = read(out_pipe[0], tmp, sizeof(tmp));
       if (n > 0) {
-        buf_append(&out->stdout_buf, &out->stdout_len, tmp, (size_t)n);
+        if (!buf_append(&out->stdout_buf, &out->stdout_len, tmp, (size_t)n) &&
+            !killed_for_output) {
+          kill(-pid, SIGKILL);
+          killed_for_output = 1;
+        }
       } else {
         close(out_pipe[0]);
         out_open = 0;
@@ -244,7 +406,11 @@ static int run_child(char *const argv[], const char *stdin_data,
       char tmp[4096];
       ssize_t n = read(err_pipe[0], tmp, sizeof(tmp));
       if (n > 0) {
-        buf_append(&out->stderr_buf, &out->stderr_len, tmp, (size_t)n);
+        if (!buf_append(&out->stderr_buf, &out->stderr_len, tmp, (size_t)n) &&
+            !killed_for_output) {
+          kill(-pid, SIGKILL);
+          killed_for_output = 1;
+        }
       } else {
         close(err_pipe[0]);
         err_open = 0;
@@ -254,7 +420,11 @@ static int run_child(char *const argv[], const char *stdin_data,
       char tmp[4096];
       ssize_t n = read(meta_pipe[0], tmp, sizeof(tmp));
       if (n > 0) {
-        buf_append(&out->meta_buf, &out->meta_len, tmp, (size_t)n);
+        if (!buf_append(&out->meta_buf, &out->meta_len, tmp, (size_t)n) &&
+            !killed_for_output) {
+          kill(-pid, SIGKILL);
+          killed_for_output = 1;
+        }
       } else {
         close(meta_pipe[0]);
         meta_open = 0;
@@ -285,12 +455,142 @@ static long parse_meta_long(const char *meta, const char *key) {
   return atol(p + strlen(key));
 }
 
-static void cleanup_workdir(const char *workdir) {
-  char *argv[] = {"rm", "-rf", (char *)workdir, NULL};
-  int exit_code, term_signal;
-  struct captured_output discard = {0};
-  run_child(argv, NULL, 0, 0, 5000, &discard, &exit_code, &term_signal);
-  free_captured(&discard);
+static double elapsed_ms(const struct timespec *start) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (now.tv_sec - start->tv_sec) * 1000.0 +
+         (now.tv_nsec - start->tv_nsec) / 1000000.0;
+}
+
+// ---- minimal base64 (no external dependency) ----
+//
+// Used to shuttle a compiled binary between server and judge process so the
+// same submission's later test cases can skip recompiling. Both ends are on
+// loopback only -- see the "compile-once" note in process_execute() for why
+// this doesn't change the trust boundary.
+
+static const char B64_TABLE[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static char *base64_encode(const unsigned char *data, size_t len) {
+  size_t out_len = 4 * ((len + 2) / 3);
+  char *out = malloc(out_len + 1);
+  if (!out) return NULL;
+  size_t i = 0, j = 0;
+  while (i + 3 <= len) {
+    unsigned int n = ((unsigned int)data[i] << 16) |
+                      ((unsigned int)data[i + 1] << 8) | data[i + 2];
+    out[j++] = B64_TABLE[(n >> 18) & 0x3F];
+    out[j++] = B64_TABLE[(n >> 12) & 0x3F];
+    out[j++] = B64_TABLE[(n >> 6) & 0x3F];
+    out[j++] = B64_TABLE[n & 0x3F];
+    i += 3;
+  }
+  size_t rem = len - i;
+  if (rem == 1) {
+    unsigned int n = (unsigned int)data[i] << 16;
+    out[j++] = B64_TABLE[(n >> 18) & 0x3F];
+    out[j++] = B64_TABLE[(n >> 12) & 0x3F];
+    out[j++] = '=';
+    out[j++] = '=';
+  } else if (rem == 2) {
+    unsigned int n =
+        ((unsigned int)data[i] << 16) | ((unsigned int)data[i + 1] << 8);
+    out[j++] = B64_TABLE[(n >> 18) & 0x3F];
+    out[j++] = B64_TABLE[(n >> 12) & 0x3F];
+    out[j++] = B64_TABLE[(n >> 6) & 0x3F];
+    out[j++] = '=';
+  }
+  out[j] = '\0';
+  return out;
+}
+
+static int base64_val(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+// NULL on malformed input (caller must treat that the same as "compile
+// failed" -- never silently fall back to compiling from source once a
+// precompiled_binary field was present, that would defeat the point of
+// the caller's cache and mask a real bug).
+static unsigned char *base64_decode(const char *in, size_t *out_len) {
+  size_t in_len = strlen(in);
+  if (in_len == 0 || in_len % 4 != 0) return NULL;
+  size_t pad = 0;
+  if (in[in_len - 1] == '=') pad++;
+  if (in_len > 1 && in[in_len - 2] == '=') pad++;
+  size_t out_cap = (in_len / 4) * 3 - pad;
+  unsigned char *out = malloc(out_cap > 0 ? out_cap : 1);
+  if (!out) return NULL;
+  size_t j = 0;
+  for (size_t i = 0; i < in_len; i += 4) {
+    int v0 = base64_val(in[i]);
+    int v1 = base64_val(in[i + 1]);
+    int is_pad2 = in[i + 2] == '=';
+    int is_pad3 = in[i + 3] == '=';
+    int v2 = is_pad2 ? 0 : base64_val(in[i + 2]);
+    int v3 = is_pad3 ? 0 : base64_val(in[i + 3]);
+    if (v0 < 0 || v1 < 0 || (!is_pad2 && v2 < 0) || (!is_pad3 && v3 < 0)) {
+      free(out);
+      return NULL;
+    }
+    unsigned int n = ((unsigned int)v0 << 18) | ((unsigned int)v1 << 12) |
+                      ((unsigned int)v2 << 6) | (unsigned int)v3;
+    if (j < out_cap) out[j++] = (n >> 16) & 0xFF;
+    if (!is_pad2 && j < out_cap) out[j++] = (n >> 8) & 0xFF;
+    if (!is_pad3 && j < out_cap) out[j++] = n & 0xFF;
+  }
+  *out_len = j;
+  return out;
+}
+
+// Walk beneath a root-owned directory by fd, never following symlinks from a
+// compiler's writable /bin or /tmp. Do not spawn rm for every test case.
+static int remove_tree_at(int parent, const char *name) {
+  struct stat st;
+  if (fstatat(parent, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+    return errno == ENOENT ? 0 : -1;
+  if (!S_ISDIR(st.st_mode)) return unlinkat(parent, name, 0);
+
+  int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return -1;
+  DIR *dir = fdopendir(fd);
+  if (!dir) { close(fd); return -1; }
+
+  int rc = 0;
+  struct dirent *entry;
+  errno = 0;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+    if (remove_tree_at(dirfd(dir), entry->d_name) != 0) { rc = -1; break; }
+    errno = 0;
+  }
+  if (errno != 0) rc = -1;
+  if (closedir(dir) != 0) rc = -1;
+  if (rc != 0) return -1;
+  return unlinkat(parent, name, AT_REMOVEDIR);
+}
+
+static int cleanup_workdir(const char *workdir) {
+  const size_t prefix = strlen(WORK_ROOT);
+  if (strncmp(workdir, WORK_ROOT "/", prefix + 1) != 0 ||
+      !workdir[prefix + 1] || strchr(workdir + prefix + 1, '/')) {
+    errno = EINVAL;
+    return -1;
+  }
+  int root = open(WORK_ROOT, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (root < 0) return -1;
+  int rc = remove_tree_at(root, workdir + prefix + 1);
+  int saved_errno = errno;
+  close(root);
+  errno = saved_errno;
+  return rc;
 }
 
 // ---- interpreter rootfs bind mounts (Python, unlike statically-linked
@@ -301,33 +601,24 @@ static void cleanup_workdir(const char *workdir) {
 // satisfy the dynamic linker -- no need to separately mount /lib, /lib64,
 // and /usr/lib/x86_64-linux-gnu as three different bind mounts.
 
-static int bind_mount_ro(const char *src, const char *dst) {
-  if (mkdir(dst, 0755) == -1 && errno != EEXIST) {
-    fprintf(stderr, "[server] mkdir %s: %s\n", dst, strerror(errno));
-    return -1;
-  }
-  if (mount(src, dst, NULL, MS_BIND | MS_REC, NULL) == -1) {
-    fprintf(stderr, "[server] bind mount %s -> %s: %s\n", src, dst,
-            strerror(errno));
-    return -1;
-  }
-  return 0;
-}
-
-// Generic across interpreted languages: mounts the given runtime package
-// (Python's or Node's piston-data tree) at /opt/runtime, plus host /usr for
-// shared libs, replicating the merged-/usr symlinks so the dynamic linker
-// resolves them normally inside the pivot_root'd rootfs.
+// Generic across interpreted languages: the runtime package (Python's or
+// Node's piston-data tree) gets bind-mounted at /opt/runtime and host /usr
+// for shared libs by jail itself (inside its own user namespace -- mounts
+// created here in the host namespace can't be remounted read-only by the
+// child, which would break jail's final recursive lockdown; see jail.c's
+// setup_rootfs_mounts). This function only prepares the directories and
+// replicates the merged-/usr symlinks so the dynamic linker resolves them
+// normally inside the pivot_root'd rootfs.
 static void setup_interpreter_rootfs(const char *rootfs_dir,
                                       const char *runtime_home) {
   char dst[400];
   snprintf(dst, sizeof(dst), "%s/opt", rootfs_dir);
   mkdir(dst, 0755);
   snprintf(dst, sizeof(dst), "%s/opt/runtime", rootfs_dir);
-  bind_mount_ro(runtime_home, dst);
+  mkdir(dst, 0755);
 
   snprintf(dst, sizeof(dst), "%s/usr", rootfs_dir);
-  bind_mount_ro("/usr", dst);
+  mkdir(dst, 0755);
 
   char link[400];
   snprintf(link, sizeof(link), "%s/lib", rootfs_dir);
@@ -340,12 +631,55 @@ static void setup_interpreter_rootfs(const char *rootfs_dir,
   }
 }
 
-static void teardown_interpreter_rootfs(const char *rootfs_dir) {
+// ---- compiler rootfs preparation ----
+//
+// Same merged-/usr trick as the interpreter rootfs above, but without a
+// /opt/runtime package tree: gcc/g++ and their whole toolchain (cc1/
+// cc1plus, as, collect2/ld, crt startup objects, headers) all live under
+// the host's /usr on this distro's layout (confirmed against the actual
+// deployed toolchain: `gcc -print-prog-name=cc1plus` etc. all resolve
+// under /usr/libexec/gcc and /usr/lib/gcc), so bind-mounting just /usr is
+// sufficient -- nothing from the app's own deployment directory, .env, or
+// any other host path is ever exposed to the compiler. This is the fix
+// for itouoj-critical-compiler-file-read: the compile step used to run
+// directly on the host with the real filesystem visible, so a
+// submission's #include could pull in and echo back any file the
+// sandbox-server process (root) could read.
+//
+// The /usr bind itself is done by jail inside its user namespace (see
+// setup_rootfs_mounts); here we only prepare the directory and symlinks.
+static void setup_compiler_rootfs(const char *rootfs_dir) {
   char dst[400];
   snprintf(dst, sizeof(dst), "%s/usr", rootfs_dir);
-  umount2(dst, MNT_DETACH);
-  snprintf(dst, sizeof(dst), "%s/opt/runtime", rootfs_dir);
-  umount2(dst, MNT_DETACH);
+  mkdir(dst, 0755);
+
+  char link[400];
+  snprintf(link, sizeof(link), "%s/lib", rootfs_dir);
+  if (symlink("usr/lib", link) == -1 && errno != EEXIST) {
+    fprintf(stderr, "[server] symlink %s: %s\n", link, strerror(errno));
+  }
+  snprintf(link, sizeof(link), "%s/lib64", rootfs_dir);
+  if (symlink("usr/lib64", link) == -1 && errno != EEXIST) {
+    fprintf(stderr, "[server] symlink %s: %s\n", link, strerror(errno));
+  }
+
+  // gcc writes scratch files (assembler intermediate output etc.) to
+  // $TMPDIR, defaulting to /tmp when unset -- this minimal rootfs has no
+  // /tmp otherwise. World-writable (like a real /tmp): the in-jail
+  // process runs as an unprivileged mapped uid that doesn't own this
+  // root-created directory, so it needs the "other" write bit to use it
+  // at all -- see the same reasoning on bin_dir below.
+  //
+  // mkdir()'s mode argument is masked by the caller's umask (sandbox-
+  // server's systemd unit runs with the standard 0022, which silently
+  // drops exactly the "other write" bit this needs) -- chmod() afterward
+  // sets the exact bits requested, unaffected by umask. Learned this the
+  // hard way: an interactive root shell's manual test of this same mkdir
+  // call didn't reproduce the bug because the test script had its own
+  // explicit chmod, masking the real gap until it hit the actual service.
+  snprintf(dst, sizeof(dst), "%s/tmp", rootfs_dir);
+  mkdir(dst, 01777);
+  chmod(dst, 01777);
 }
 
 // ---- HTTP layer ----
@@ -409,6 +743,8 @@ static cJSON *build_phase_json(struct captured_output *o, int exit_code,
 
 static enum MHD_Result process_execute(struct MHD_Connection *conn,
                                         const char *body, size_t body_len) {
+  struct timespec request_start, phase_start;
+  clock_gettime(CLOCK_MONOTONIC, &request_start);
   cJSON *req = cJSON_ParseWithLength(body, body_len);
   if (!req) {
     return send_text_response(conn, 400, "invalid json\n");
@@ -421,6 +757,13 @@ static enum MHD_Result process_execute(struct MHD_Connection *conn,
   cJSON *j_run_mem = cJSON_GetObjectItemCaseSensitive(req, "run_memory_limit");
   cJSON *j_compile_timeout =
       cJSON_GetObjectItemCaseSensitive(req, "compile_timeout");
+  // 選填：呼叫端快取住的上一次編譯結果（base64），同一筆 submission
+  // 後續測資帶著這個欄位來就跳過重新編譯，直接拿這份執行檔去跑。
+  cJSON *j_precompiled =
+      cJSON_GetObjectItemCaseSensitive(req, "precompiled_binary");
+  cJSON *j_handle = cJSON_GetObjectItemCaseSensitive(req, "compiled_handle");
+  int want_handle = cJSON_IsTrue(
+      cJSON_GetObjectItemCaseSensitive(req, "want_compiled_handle"));
 
   if (!cJSON_IsString(j_language) || !cJSON_IsArray(j_files) ||
       cJSON_GetArraySize(j_files) < 1) {
@@ -457,6 +800,8 @@ static enum MHD_Result process_execute(struct MHD_Connection *conn,
                                  : 15000;
 
   int is_interpreted = lang->compiler == NULL;
+  int has_precompiled = !is_interpreted && cJSON_IsString(j_precompiled) &&
+                         j_precompiled->valuestring[0] != '\0';
 
   // --- per-request scratch workdir ---
   mkdir(WORK_ROOT, 0755);
@@ -464,9 +809,9 @@ static enum MHD_Result process_execute(struct MHD_Connection *conn,
   snprintf(workdir, sizeof(workdir), "%s/%ld-%d", WORK_ROOT, (long)time(NULL),
            rand());
   mkdir(workdir, 0755);
-  char rootfs_dir[300], bin_dir[320], src_path[340], bin_path[360];
+  char rootfs_dir[300], bin_dir[320], src_path[400], bin_path[360];
   char work_dir_in_rootfs[340], interp_src_path[380];
-  char script_path_in_rootfs[64];
+  char script_path_in_rootfs[64], src_path_in_rootfs[64];
   snprintf(rootfs_dir, sizeof(rootfs_dir), "%s/rootfs", workdir);
   mkdir(rootfs_dir, 0755);
 
@@ -490,9 +835,24 @@ static enum MHD_Result process_execute(struct MHD_Connection *conn,
     run_program_argv[run_program_argc++] = (char *)lang->interpreter_path;
     run_program_argv[run_program_argc++] = script_path_in_rootfs;
   } else {
+    // Written to /bin (world-writable -- see setup_compiler_rootfs's /tmp
+    // comment for why, including the umask gotcha this chmod works
+    // around) so the compile jail can write /bin/prog there; the run
+    // phase later execve()s that same path under its own, separately-
+    // jailed, fully read-only-locked view of this rootfs.
     snprintf(bin_dir, sizeof(bin_dir), "%s/bin", rootfs_dir);
-    mkdir(bin_dir, 0755);
-    snprintf(src_path, sizeof(src_path), "%s/%s", workdir, lang->filename);
+    mkdir(bin_dir, 0777);
+    chmod(bin_dir, 0777);
+    // Source lives inside rootfs_dir (not the parent workdir) so the
+    // compile jail's pivoted view can see it at /work/<filename> --
+    // mirrors the interpreted branch above.
+    snprintf(work_dir_in_rootfs, sizeof(work_dir_in_rootfs), "%s/work",
+             rootfs_dir);
+    mkdir(work_dir_in_rootfs, 0755);
+    snprintf(src_path, sizeof(src_path), "%s/%s", work_dir_in_rootfs,
+             lang->filename);
+    snprintf(src_path_in_rootfs, sizeof(src_path_in_rootfs), "/work/%s",
+             lang->filename);
     snprintf(bin_path, sizeof(bin_path), "%s/prog", bin_dir);
     FILE *sf = fopen(src_path, "w");
     if (sf) {
@@ -505,6 +865,26 @@ static enum MHD_Result process_execute(struct MHD_Connection *conn,
   cJSON *resp = cJSON_CreateObject();
   cJSON_AddStringToObject(resp, "language", j_language->valuestring);
   cJSON_AddStringToObject(resp, "version", "sandbox-runner-m7");
+  double setup_ms = elapsed_ms(&request_start);
+  clock_gettime(CLOCK_MONOTONIC, &phase_start);
+
+  int cache_hit = 0;
+  if (!is_interpreted && want_handle && cJSON_IsString(j_handle)) {
+    struct cache_entry *entry = cache_find(j_handle->valuestring, lang,
+                                            j_content->valuestring);
+    if (entry) {
+      char path[256];
+      cache_path(path, sizeof(path), entry->token);
+      if (link(path, bin_path) == 0) {
+        entry->last_used = time(NULL);
+        cache_hit = 1;
+        cJSON_AddStringToObject(resp, "compiled_handle", entry->token);
+      } else {
+        cache_remove(entry); // missing cache file: recompile the source below
+      }
+    }
+  }
+  if (want_handle) cJSON_AddBoolToObject(resp, "compiled_cache_hit", cache_hit);
 
   int compile_failed = 0;
   if (is_interpreted) {
@@ -513,20 +893,123 @@ static enum MHD_Result process_execute(struct MHD_Connection *conn,
     struct captured_output empty = {0};
     cJSON_AddItemToObject(resp, "compile",
                            build_phase_json(&empty, 0, -1, 0, 0));
+  } else if (cache_hit) {
+    struct captured_output empty = {0};
+    cJSON_AddItemToObject(resp, "compile",
+                           build_phase_json(&empty, 0, -1, 0, 0));
+  } else if (has_precompiled) {
+    // compile-once: caller already has this exact submission compiled from
+    // an earlier test case in the same judging pass and is handing the
+    // binary straight back instead of source -- write it directly where
+    // the freshly-compiled binary would have gone and skip invoking the
+    // compiler entirely. Doesn't touch the run-phase sandboxing at all
+    // (jail below runs /bin/prog exactly the same either way), so this
+    // only changes how the binary gets into that path, not what's allowed
+    // to happen once jail takes over.
+    size_t decoded_len = 0;
+    unsigned char *decoded =
+        base64_decode(j_precompiled->valuestring, &decoded_len);
+    struct captured_output empty = {0};
+    if (decoded && decoded_len > 0) {
+      FILE *bf = fopen(bin_path, "wb");
+      if (bf) {
+        fwrite(decoded, 1, decoded_len, bf);
+        fclose(bf);
+        chmod(bin_path, 0755);
+      } else {
+        compile_failed = 1;
+      }
+    } else {
+      // Malformed cache value from the caller -- treat as a hard failure
+      // rather than silently falling back to compiling from source, so a
+      // bug on the caller's side surfaces immediately instead of masking
+      // itself as "just a bit slower than expected".
+      compile_failed = 1;
+    }
+    free(decoded);
+    cJSON_AddItemToObject(
+        resp, "compile",
+        build_phase_json(&empty, compile_failed ? -1 : 0, -1, 0, 0));
   } else {
-    // --- compile (host-side, not sandboxed -- see file header) ---
+    // --- compile, jailed (fix for itouoj-critical-compiler-file-read) ---
+    // Used to run directly on the host via run_child(); now goes through
+    // the same `jail` binary the run phase uses below, pointed at this
+    // request's own rootfs_dir with /usr bind-mounted read-only by
+    // setup_compiler_rootfs. The compiler can now only ever see that
+    // read-only toolchain plus this one request's own /work (source) and
+    // /bin (output) -- no app deployment directory, .env, or other host
+    // path is reachable, however a submission's #include is crafted.
+    setup_compiler_rootfs(rootfs_dir);
+
     struct captured_output compile_out = {0};
     int compile_exit = 0, compile_sig = -1;
-    char *compile_argv[] = {(char *)lang->compiler, "-O2", "-static",
-                             "-o",  bin_path,        src_path, NULL};
-    run_child(compile_argv, NULL, 0, 0, compile_timeout_ms, &compile_out,
-              &compile_exit, &compile_sig);
+    char compile_mem_s[16], compile_to_s[16];
+    snprintf(compile_mem_s, sizeof(compile_mem_s), "%d", COMPILE_MEM_MB);
+    snprintf(compile_to_s, sizeof(compile_to_s), "%ld", compile_timeout_ms);
+
+    char *compile_jail_argv[] = {JAIL_BIN,
+                                  rootfs_dir,
+                                  compile_mem_s,
+                                  (char *)COMPILE_PIDS_MAX,
+                                  compile_to_s,
+                                  "compile",
+                                  "-",
+                                  (char *)lang->compiler,
+                                  "-O2",
+                                  "-static",
+                                  "-o",
+                                  "/bin/prog",
+                                  src_path_in_rootfs,
+                                  NULL};
+    // Outer timeout generous relative to compile_timeout_ms for the same
+    // reason the run phase's is below -- jail enforces the real limit
+    // itself via cgroup.kill.
+    //
+    // Known simplification: compile_exit/compile_sig below are now
+    // jail's own exit status, not gcc's directly -- jail folds a signaled
+    // or timed-out inner process into its own plain exit code (128+sig,
+    // or 124 for timeout; see jail.c's main()), so a compiler crash shows
+    // up here as e.g. code=139 rather than signal=SIGSEGV. Doesn't affect
+    // compile_failed below (still correctly true either way) or any
+    // caller (judge.ts/route.ts only ever check compile.code !== 0), just
+    // the cosmetic shape of a failed compile's JSON.
+    run_child(compile_jail_argv, NULL, 0, 1, compile_timeout_ms + 3000,
+              &compile_out, &compile_exit, &compile_sig);
     cJSON_AddItemToObject(
         resp, "compile",
         build_phase_json(&compile_out, compile_exit, compile_sig, 0, 0));
     compile_failed = compile_sig >= 0 || compile_exit != 0;
     free_captured(&compile_out);
+
+    // 新版回傳短代碼，舊版仍回傳編譯檔；快取不可用時，下次從原始碼重編。
+    if (!compile_failed && want_handle) {
+      const char *token = cache_store(bin_path, lang, j_content->valuestring);
+      if (token) cJSON_AddStringToObject(resp, "compiled_handle", token);
+    } else if (!compile_failed) {
+      FILE *bf = fopen(bin_path, "rb");
+      if (bf) {
+        fseek(bf, 0, SEEK_END);
+        long bin_size = ftell(bf);
+        fseek(bf, 0, SEEK_SET);
+        if (bin_size > 0 && bin_size <= MAX_LEGACY_BINARY_BYTES) {
+          unsigned char *bin_data = malloc((size_t)bin_size);
+          if (bin_data && fread(bin_data, 1, (size_t)bin_size, bf) ==
+                              (size_t)bin_size) {
+            char *encoded = base64_encode(bin_data, (size_t)bin_size);
+            if (encoded) {
+              cJSON_AddStringToObject(resp, "compiled_binary", encoded);
+              free(encoded);
+            }
+          }
+          free(bin_data);
+        }
+        fclose(bf);
+      }
+    }
   }
+
+  double compile_ms = elapsed_ms(&phase_start);
+  clock_gettime(CLOCK_MONOTONIC, &phase_start);
 
   if (compile_failed) {
     struct captured_output empty = {0};
@@ -538,7 +1021,7 @@ static enum MHD_Result process_execute(struct MHD_Connection *conn,
     snprintf(mem_s, sizeof(mem_s), "%ld", run_mem_mb);
     snprintf(to_s, sizeof(to_s), "%ld", run_timeout_ms);
 
-    char *jail_argv[10];
+    char *jail_argv[11];
     int n = 0;
     jail_argv[n++] = JAIL_BIN;
     jail_argv[n++] = rootfs_dir;
@@ -546,6 +1029,8 @@ static enum MHD_Result process_execute(struct MHD_Connection *conn,
     jail_argv[n++] = (char *)DEFAULT_PIDS_MAX;
     jail_argv[n++] = to_s;
     jail_argv[n++] = (char *)lang->seccomp_profile;
+    // 解釋型語言要綁 runtime package；編譯型語言不用（"-"）
+    jail_argv[n++] = lang->runtime_home ? (char *)lang->runtime_home : (char *)"-";
     for (int i = 0; i < run_program_argc; i++) jail_argv[n++] = run_program_argv[i];
     jail_argv[n] = NULL;
 
@@ -578,12 +1063,22 @@ static enum MHD_Result process_execute(struct MHD_Connection *conn,
         build_phase_json(&run_out, run_code, run_signal, mem_peak, (double)wall_ms));
     free_captured(&run_out);
   }
-
-  if (is_interpreted) {
-    teardown_interpreter_rootfs(rootfs_dir);
-  }
+  double run_ms = elapsed_ms(&phase_start);
   cJSON_Delete(req);
-  cleanup_workdir(workdir);
+  clock_gettime(CLOCK_MONOTONIC, &phase_start);
+  if (cleanup_workdir(workdir) != 0)
+    fprintf(stderr, "[sandbox-server] cleanup %s: %s\n", workdir, strerror(errno));
+  double cleanup_ms = elapsed_ms(&phase_start);
+
+  // Aggregate only timings and sizes in the caller's logs, never source or
+  // test data. These fields describe the HTTP request, not the student's CPU.
+  cJSON *metrics = cJSON_AddObjectToObject(resp, "metrics");
+  cJSON_AddNumberToObject(metrics, "setup_ms", setup_ms);
+  cJSON_AddNumberToObject(metrics, "compile_ms", compile_ms);
+  cJSON_AddNumberToObject(metrics, "run_ms", run_ms);
+  cJSON_AddNumberToObject(metrics, "cleanup_ms", cleanup_ms);
+  cJSON_AddNumberToObject(metrics, "total_ms", elapsed_ms(&request_start));
+  cJSON_AddNumberToObject(metrics, "request_bytes", body_len);
 
   enum MHD_Result rc = send_json_response(conn, 200, resp);
   cJSON_Delete(resp);
@@ -593,6 +1088,7 @@ static enum MHD_Result process_execute(struct MHD_Connection *conn,
 struct conn_ctx {
   char *body;
   size_t body_len;
+  int too_large;
 };
 
 static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
@@ -619,6 +1115,11 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
 
   struct conn_ctx *ctx = *con_cls;
   if (*upload_data_size > 0) {
+    if (ctx->too_large || *upload_data_size > MAX_REQUEST_BYTES - ctx->body_len) {
+      ctx->too_large = 1;
+      *upload_data_size = 0;
+      return MHD_YES;
+    }
     char *grown = realloc(ctx->body, ctx->body_len + *upload_data_size + 1);
     if (!grown) return MHD_NO;
     ctx->body = grown;
@@ -629,8 +1130,9 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn,
     return MHD_YES;
   }
 
-  enum MHD_Result rc = process_execute(conn, ctx->body ? ctx->body : "",
-                                        ctx->body_len);
+  enum MHD_Result rc = ctx->too_large
+      ? send_text_response(conn, 413, "request body too large\n")
+      : process_execute(conn, ctx->body ? ctx->body : "", ctx->body_len);
   free(ctx->body);
   free(ctx);
   *con_cls = NULL;
@@ -653,6 +1155,15 @@ static void request_completed(void *cls, struct MHD_Connection *conn,
 
 int main(void) {
   srand((unsigned)time(NULL) ^ (unsigned)getpid());
+
+  // Handles are process-local: remove orphaned files from a previous crash.
+  // Failure to initialize the cache only costs recompilation, never judging.
+  mkdir(WORK_ROOT, 0755);
+  if (cleanup_workdir(CACHE_ROOT) != 0)
+    fprintf(stderr, "[sandbox-server] stale cache cleanup: %s\n", strerror(errno));
+  cache_ready = mkdir(CACHE_ROOT, 0700) == 0;
+  if (!cache_ready)
+    fprintf(stderr, "[sandbox-server] compiled cache unavailable\n");
 
   // Bind loopback-only, matching Piston's own trust boundary today (nothing
   // routes here through nginx) -- MHD_start_daemon defaults to 0.0.0.0

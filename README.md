@@ -1,12 +1,12 @@
-# itouSandbox
+# sandbox-runner
 
 > 從零實作的 Linux 判題沙箱：namespace 隔離 + cgroup v2 資源限制 + seccomp-bpf syscall 白名單。跑在正式站 [oj.itousouta.me](https://oj.itousouta.me) 上，取代原本的 [Piston](https://github.com/engineer-man/piston)。
 
-C / C++ / Python / JavaScript 判題現在都走這裡。Java 還沒做，暫時繼續用 Piston（見〈語言支援現況〉）。
+C / C++ / Python / JavaScript 的提交與測試執行都走這裡；Java 已停止接受新提交，舊提交紀錄仍保留。
 
 ## 為什麼要自己刻
 
-Piston 的沙箱只管 CPU / 記憶體 / 時間跟檔案系統範圍，**不管使用者程式碼能不能呼叫子程序**——`import subprocess` 或 `os.system` 在容器裡就能跑任意指令。itouOJ 原本只靠一份 [`sitecustomize.py`](https://github.com/itousouta15/itouOJ/blob/master/deploy/piston-python-sitecustomize.py) 在 Python 直譯器層級擋這件事，C/C++/Java/JavaScript 完全沒有保護。
+Piston 的沙箱只管 CPU / 記憶體 / 時間跟檔案系統範圍，**不管使用者程式碼能不能呼叫子程序**——`import subprocess` 或 `os.system` 在容器裡就能跑任意指令。itouOJ 原本只靠一份 [`sitecustomize.py`](../deploy/piston-python-sitecustomize.py) 在 Python 直譯器層級擋這件事，C/C++/Java/JavaScript 完全沒有保護。
 
 這個專案要的是語言無關、核心層級的防護，而不是每種語言在應用層各自擋一次。`sitecustomize.py` 這類稽核鉤子仍然有價值（比字串黑名單擋 `import` 紮實），但它是應用層的第二道防線；真正的邊界是下面這三層——就算鉤子有漏洞或整個拿掉，`fork`/`execve /bin/sh` 這類逃逸手法一樣會在 seccomp/namespace 被攔下（見〈驗證方式〉）。
 
@@ -16,11 +16,11 @@ Piston 的沙箱只管 CPU / 記憶體 / 時間跟檔案系統範圍，**不管�
 Browser ──HTTPS──> nginx ──:3000──> Next.js (judge.ts)
                                           │
                                  src/lib/execute.ts
-                                    （依語言分流）
-                          ┌───────────────┴───────────────┐
-                    C/C++/Python/JS                      Java
-                          │                                 │
-              sandbox-server :8090                Piston :2000 (Docker)
+                                   （呼叫沙箱）
+                           │
+                     C/C++/Python/JS
+                           │
+               sandbox-server :8090
               ┌─────────────────────┐
               │ jail（每個請求一次）   │
               │  namespaces          │
@@ -29,7 +29,7 @@ Browser ──HTTPS──> nginx ──:3000──> Next.js (judge.ts)
               └─────────────────────┘
 ```
 
-兩條路徑互相獨立，一邊掛掉不影響另一邊（見〈驗證方式〉）。
+桌機 Terminal 另外使用 `sandbox-interactive :8091`，也會呼叫同一個 `jail`。
 
 ## 三層防護
 
@@ -97,10 +97,22 @@ jail <rootfs-dir> <mem-limit-mb> <pids-max> <timeout-ms> <seccomp-profile> <prog
 
 `jail` 只是單次呼叫的 CLI 工具；`sandbox-server` 包成跟 Piston `/api/v2/execute` 欄位相容的 HTTP 服務（只綁 `127.0.0.1:8090`），讓 itouOJ 只需要換一個 client 模組。
 
-- 編譯階段目前不進沙箱（host 上跑 `gcc`/`g++ -O2 -static`）——攻擊者控制的是原始碼、不是機器碼，風險模型不同，刻意簡化。
+- C/C++ 編譯階段也使用獨立的 `compile` 沙箱與 seccomp profile，不會直接讀取主機上的網站檔案。
 - Python / JavaScript 沒有編譯階段，bind mount `/opt/piston-data` 裡的直譯器進沙箱 rootfs，執行完就 `umount`。
 - 每個請求獨立暫存目錄 + `poll()` 多工處理 stdin/stdout/stderr，避免管線緩衝區塞滿死結。
 - 單執行緒，同一時間只判一筆——簡單但有效的併發保護。
+- C/C++ 的第一筆測資完成編譯後，回傳 `compiled_handle`；同一份原始碼的後續測資用代碼重用沙箱端執行檔，不需反覆傳送 base64。每筆測資仍建立新的 jail。快取限 16 筆／64 MiB、單檔 16 MiB，閒置 15 分鐘過期；淘汰或服務重啟後會從原始碼重新編譯。舊版 `precompiled_binary` 暫保留，以支援分階段部署。
+
+在可執行 `jail` 的 Linux 主機上，以不同的本機埠執行傳輸量／延遲比較及快取失效回歸測試，避免占用正式站的 8090：
+
+```sh
+cc -O2 -DPORT=18090 -o /tmp/oj-sandbox-test src/server.c -lmicrohttpd -lcjson
+python3 test/test_compile_cache.py --server /tmp/oj-sandbox-test --jail ./jail --port 18090 --mode cache
+python3 test/test_compile_cache.py --server /tmp/oj-sandbox-test --jail ./jail --port 18090 --mode legacy
+```
+
+正式站更新後可執行 `python3 test/smoke_live_cache.py`，只向本機沙箱送兩筆範例執行請求，不會新增或修改提交紀錄。
+沙箱回應的 `metrics` 包含 setup、compile、run、cleanup 與 total 時間（毫秒）及請求位元組數；Next.js 會以 `[sandbox-metrics]` 記錄請求來源、排隊及傳輸時間，不包含使用者程式或測資內容。
 
 ## 語言支援現況
 
@@ -109,9 +121,10 @@ jail <rootfs-dir> <mem-limit-mb> <pids-max> <timeout-ms> <seccomp-profile> <prog
 | C / C++ | ✅ 正式站使用中 | 靜態編譯，seccomp 白名單最窄 |
 | Python 3.12 | ✅ 正式站使用中 | |
 | JavaScript (Node 20) | ✅ 正式站使用中 | fork-bomb 防線靠 `pids.max` |
-| Java | ❌ 未實作 | JVM 的 syscall 面最廣，留到最後 |
 
-`judge.ts` 用 [`src/lib/execute.ts`](https://github.com/itousouta15/itouOJ/blob/master/src/lib/execute.ts) 按語言分流，兩條路徑互相獨立（已用「關掉 sandbox-server，確認 Java 提交照樣正常」實測驗證）。
+Java 已停止接受新提交；歷史判題資料仍保留。
+
+`judge.ts` 透過 [`src/lib/execute.ts`](../src/lib/execute.ts) 使用沙箱；Python 與 Node 執行檔仍從 `/opt/piston-data` 的既有套件目錄掛入，關掉 Piston 容器後請保留此目錄。
 
 ## 驗證方式
 
@@ -142,10 +155,64 @@ cd sandbox-runner && make        # 產出 jail、sandbox-server
 
 正式環境用 [`deploy/sandbox-server.service`](deploy/sandbox-server.service) 跑成 systemd 服務，跟 `jail` 一樣必須用 root 執行（建立 namespace/cgroup 需要的權限沒辦法給非特權使用者）。真正的安全邊界不是「這支程式不是 root」，而是〈`jail`〉第 5 點那串嚴格順序——root 權限只存在於短暫的 bootstrap 期間，受評測程式從來沒機會拿到它。
 
-## 已知限制
+## Terminal（互動執行）
 
-- Java 語言支援
-- 編譯階段（`gcc`/`g++`）本身還沒沙箱化
+桌機編輯器的 **Terminal** 會啟動一個真正持續運作的程式，可逐行輸入及接收輸出。
+它不會重跑先前的 stdin，也不建立提交／判分紀錄。
+
+- C／C++：編譯與執行都使用原本的 `jail`；Python／JavaScript 使用同一組語言隔離設定。
+- Terminal 中 Enter 送出一行、Shift+Enter 換行、EOF（Ctrl+D）結束 stdin、停止（Ctrl+C）終止程式。
+- `fs.readFileSync(0)`、`sys.stdin.read()`、`while (cin >> x)` 等讀到檔尾的程式，需要按 EOF 才會繼續／結束。
+- C/C++ 若關閉 `cin.tie`，無換行的提示請自行 `std::flush`／`fflush(stdout)`；Python 以 `-u` 啟動。
+- 每次執行最長 120 秒（另有 15 秒編譯限制），CPU 時間仍依題目限制（最多 30 秒）；等待輸入不耗 CPU 額度。
+- 每人最多一個互動工作階段、全站最多四個；輸入 64 KiB、輸出 256 KiB。關閉頁面會停止，斷線超過 30 秒自動清理。
+
+`interactive.py` 是 Python 3 標準函式庫服務，僅監聽 `127.0.0.1:8091`。
+Next.js `/api/terminal` 驗證登入、題目可見性、比賽權限與限定語言；後續的輸入／輸出／停止操作
+都以登入者 ID 驗證工作階段擁有者。請勿把 8091 直接開放到網際網路。
+前端以 long polling 接收增量輸出，輸入另用 POST，所以不需要額外的 WebSocket 反向代理設定。
+
+### Linux 正式環境
+
+更新 `jail`（本版加入可清理 cgroup 的 SIGTERM 停止與獨立 CPU 時間限制），再啟用服務：
+
+```sh
+cd /opt/sandbox-runner
+make jail
+sudo cp deploy/sandbox-interactive.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sandbox-interactive
+```
+
+Next.js 預設連線 `http://127.0.0.1:8091`，不同位置可設定 `INTERACTIVE_SANDBOX_URL`。
+沙箱端可設定 `PYTHON_HOME`、`NODE_HOME`、`INTERACTIVE_WORK_ROOT`；正式環境預設沿用 `/opt/piston-data` 的 runtime。
+
+### Windows 本機開發（WSL2 Ubuntu 24.04）
+
+沙箱需要 Linux namespace／cgroup，不能直接在 Windows Node.js 中跑使用者程式。
+在專案的 `sandbox-runner` 目錄，另開 PowerShell 執行：
+
+```powershell
+wsl -u root -- apt-get install -y gcc g++ libseccomp-dev python3 nodejs
+wsl -u root -- gcc -O2 -Wall -Wextra -o jail src/jail.c src/cgroup.c src/caps.c src/seccomp.c -lseccomp
+wsl -u root -- python3 dev-wsl.py
+```
+
+保持這個視窗運作，原本 Windows 上的 `npm run dev` 透過 localhost:8091 連線。
+`dev-wsl.py` 僅在私有 mount namespace 裡處理 WSL 的掛載差異，工作目錄使用暫存 tmpfs，
+不會修改宿主機的 WSL 驅動掛載。此開發環境使用 Ubuntu 的 GCC／Python／Node 版本，可能與正式站標籤不同。
+
+### 整合測試
+
+```sh
+sudo PYTHON_HOME=/usr python3 -m unittest discover -s test -p test_interactive.py -v
+```
+
+需要已建置的 jail 與可用的 cgroup v2；測試涵蓋多輪輸入、UTF-8、EOF、停止、斷線清理、
+跨使用者存取、編譯錯誤、CPU 與輸出限制。
+
+## 其他已知限制
+
+- Java 已下線，既有歷史提交仍可查閱
 - rootfs 直接 bind mount 整個 host `/usr`，還沒收斂成只含實際用到的 `.so`
 - 逾時偵測是 5ms 輪詢，不是 `timerfd`，精度夠用但不是最優
-- Piston（Java 用）的三個補丁是 `docker exec ... sed -i` 直接改 container 內部檔案（見主站 [itouOJ README](https://github.com/itousouta15/itouOJ#部署)）——Piston image 更新後 `sed` 可能悄悄不匹配、補丁靜默失效。比較耐用的做法是維護自己的 patch 檔 + 自建 image，目前 Java 量還小，先沒做這個重構
